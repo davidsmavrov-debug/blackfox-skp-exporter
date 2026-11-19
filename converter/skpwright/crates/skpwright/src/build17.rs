@@ -2134,6 +2134,7 @@ impl<'m> Builder<'m> {
             }
             let value = match (f.kind, stored(f.name, v)) {
                 (RoKind::Bool, v) => StyleVal::U8(ro_bytes(RoKind::Bool, v)[0]),
+                (RoKind::F32, RoValue::F32(x)) => StyleVal::F32(x),
                 (RoKind::F64, RoValue::F64(x)) => StyleVal::F64(x),
                 (RoKind::F32, v) => {
                     // A float item has no 2017 form; the value every
@@ -2170,6 +2171,15 @@ impl<'m> Builder<'m> {
                 crate::StyleValue::Int(i) => StyleVal::U32(*i as u32),
                 crate::StyleValue::Double(f) => StyleVal::F64(*f),
                 crate::StyleValue::Colour(c) => StyleVal::Rgba(*c),
+                crate::StyleValue::Other { kind: 6, text } => {
+                    match text.parse::<f32>() {
+                        Ok(value) => StyleVal::F32(value),
+                        Err(_) => {
+                            self.notes.push(format!("invalid float for style item {}", x.id));
+                            continue;
+                        }
+                    }
+                }
                 crate::StyleValue::Other { kind, text } => {
                     // A value every 2026 file holds loses nothing.
                     let constant = crate::xml26::STYLE_CONSTANTS

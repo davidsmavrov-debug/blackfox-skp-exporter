@@ -976,6 +976,10 @@ fn style(
                     StyleVal::U8(x) => Some(crate::StyleValue::Bool(*x != 0)),
                     StyleVal::U32(x) => Some(crate::StyleValue::Int(*x as i32)),
                     StyleVal::Rgba(x) => Some(crate::StyleValue::Colour(*x)),
+                    StyleVal::F32(x) => Some(crate::StyleValue::Other {
+                        kind: 6,
+                        text: x.to_string(),
+                    }),
                     StyleVal::F64(x) => Some(crate::StyleValue::Double(*x)),
                     StyleVal::Ptr(_) => None,
                 };
@@ -990,6 +994,7 @@ fn style(
                 StyleVal::U8(x) => (RoKind::Bool, vec![*x]),
                 StyleVal::U32(x) => (RoKind::U32, x.to_le_bytes().to_vec()),
                 StyleVal::Rgba(x) => (RoKind::Rgba, x.to_vec()),
+                StyleVal::F32(x) => (RoKind::F32, x.to_le_bytes().to_vec()),
                 StyleVal::F64(x) => (RoKind::F64, x.to_le_bytes().to_vec()),
                 StyleVal::Ptr(_) => continue,
             };

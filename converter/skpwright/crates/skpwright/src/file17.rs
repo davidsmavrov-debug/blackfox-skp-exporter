@@ -724,6 +724,7 @@ pub(crate) enum StyleVal {
     U8(u8),
     U32(u32),
     Rgba([u8; 4]),
+    F32(f32),
     F64(f64),
     /// A watermark of item 5001 (null marks the model).
     Ptr(Ptr),
@@ -1580,6 +1581,7 @@ fn style(ar: &mut Ar, v: &mut Style17) -> R {
                         1 => StyleVal::U8(0),
                         4 => StyleVal::U32(0),
                         5 => StyleVal::Rgba([0; 4]),
+                        6 => StyleVal::F32(0.0),
                         7 => StyleVal::F64(0.0),
                         other => {
                             return Err(Error(format!(
@@ -1598,6 +1600,7 @@ fn style(ar: &mut Ar, v: &mut Style17) -> R {
                     StyleVal::U8(_) => 1u32,
                     StyleVal::U32(_) => 4,
                     StyleVal::Rgba(_) => 5,
+                    StyleVal::F32(_) => 6,
                     StyleVal::F64(_) => 7,
                     StyleVal::Ptr(_) => 0,
                 };
@@ -1668,6 +1671,12 @@ fn style_value(ar: &mut Ar, v: &mut StyleVal) -> R {
         StyleVal::U8(x) => ar.u8(x),
         StyleVal::U32(x) => ar.u32(x),
         StyleVal::Rgba(x) => ar.bytes(x),
+        StyleVal::F32(x) => {
+            let mut bits = x.to_bits();
+            ar.u32(&mut bits)?;
+            *x = f32::from_bits(bits);
+            Ok(())
+        }
         StyleVal::F64(x) => ar.f64(x),
         StyleVal::Ptr(p) => ar.ptr_to(p, &["CWatermark"]),
     }
