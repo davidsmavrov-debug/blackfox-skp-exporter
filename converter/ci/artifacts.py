@@ -122,6 +122,8 @@ def manifest(downloads):
     cargo_manifest = (CONVERTER / "Cargo.toml").read_text(encoding="utf-8-sig")
     build_version = tomllib.loads(cargo_manifest)["package"]["version"]
     check(re.fullmatch(r"[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}", build_version), "Unexpected version format.")
+    expected_cli_version = f"BlackFox SKP Importer {build_version} / Exporter {build_version}"
+    check(versions == {expected_cli_version}, "CLI version does not match Cargo package version.")
     draft = {
         "schema": 1,
         "repository": None,
