@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/skpwright",
+    "crates/skpwright-cli",
+    "crates/skpwright-capi",
+]
+
+[workspace.package]
+version = "0.6.0"
+edition = "2021"
+license = "GPL-3.0-only"
+repository = "https://github.com/hew3d/skpwright"
+authors = ["Kurt Granroth <kurt.git@granroth.com>"]
+
+[profile.release]
+opt-level = 3

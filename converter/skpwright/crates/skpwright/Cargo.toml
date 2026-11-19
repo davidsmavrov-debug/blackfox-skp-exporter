@@ -1,0 +1,29 @@
+[package]
+name = "skpwright"
+description = "Clean-room reader and writer for SketchUp .skp files: stream-container releases 3 to 8 and 2013 to 2020 and the 2026 container as saved by SketchUp 2026 and 2027"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["sketchup", "skp", "cad", "parser", "3d"]
+categories = ["parser-implementations"]
+exclude = ["tests/", "examples/"]
+
+# The core library keeps its runtime dependencies minimal so it drops
+# cleanly into any build: only a pure-Rust DEFLATE decoder, needed for the
+# 2026 container's ZIP archive. Test-only deps live under
+# dev-dependencies.
+
+[dependencies]
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
+
+[features]
+# Hooks for the mutation test (`docs/DEVELOPMENT.md`): one release rule
+# made wrong at a time, and a record of the rules each read asks. Off,
+# the rules are plain functions.
+mutation = []
+
+[dev-dependencies]
+serde_json = "1"

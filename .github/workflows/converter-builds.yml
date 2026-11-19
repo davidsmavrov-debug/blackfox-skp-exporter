@@ -1,0 +1,91 @@
+name: Build BlackFox SKP converters
+on:
+  push:
+    branches: [converter-build-matrix]
+    paths:
+      - 'converter/**'
+      - '.github/workflows/converter-builds.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  converter:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 12
+    defaults:
+      run:
+        working-directory: converter
+        shell: bash
+    env:
+      TARGET: ${{ matrix.target }}
+      RUST_VERSION: '1.99.1'
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_VERSION-$TARGET" --profile minimal
+          rustc "+$RUST_VERSION-$TARGET" -vV
+      - name: Build and run Rust tests offline
+        run: |
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            export MSYS2_ARG_CONV_EXCL='*'
+            export RUSTFLAGS="-C target-feature=+crt-static"
+            cargo "+$RUST_VERSION-$TARGET" rustc --release --locked --offline --target "$TARGET" --bin BlackFoxSKP -- -C link-arg=/Brepro -C link-arg=/DEBUG:NONE
+          else
+            cargo "+$RUST_VERSION-$TARGET" build --release --locked --offline --target "$TARGET" --bin BlackFoxSKP
+          fi
+          cargo "+$RUST_VERSION-$TARGET" test --release --locked --offline --target "$TARGET"
+      - name: Verify architecture and smoke test both CLI directions
+        run: python ci/artifacts.py verify "$TARGET"
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: converter-${{ matrix.target }}
+          path: converter/dist/${{ matrix.target }}/
+          if-no-files-found: error
+          retention-days: 7
+  metadata:
+    name: Verify all six artifacts and assemble draft manifest
+    needs: converter
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: converter-*
+          path: candidates
+      - run: python converter/ci/artifacts.py manifest candidates
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: blackfox-release-draft-metadata
+          path: candidates/metadata/
+          if-no-files-found: error
+          retention-days: 7
+

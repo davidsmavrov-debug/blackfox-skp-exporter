@@ -1,0 +1,790 @@
+//! Byte-scan extractors for records that sit outside the geometry pointer graph:
+//! materials, layers, scenes, guides, attribute dictionaries, component
+//! definitions/instances, and embedded images. Each anchors on a robust on-disk
+//! signature (usually a `FF FE FF <len>` UTF-16 string record) rather than a
+//! full walk.
+//!
+//! Port of the `skpparse.*` scanners, `skpwalk.component_*`, and
+//! `extract_images.extract_images`.
+
+use crate::{AttrValue, Attribute, Definition, Guide, Image, Instance, Layer, Material, INCH};
+
+// ---- shared low-level helpers ----
+
+pub(crate) fn u16le(d: &[u8], off: usize) -> Option<u16> {
+    d.get(off..off + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+}
+pub(crate) fn u32le(d: &[u8], off: usize) -> Option<u32> {
+    d.get(off..off + 4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+fn i32le(d: &[u8], off: usize) -> Option<i32> {
+    u32le(d, off).map(|v| v as i32)
+}
+pub(crate) fn f64le(d: &[u8], off: usize) -> Option<f64> {
+    d.get(off..off + 8).map(|b| {
+        let mut a = [0u8; 8];
+        a.copy_from_slice(b);
+        f64::from_le_bytes(a)
+    })
+}
+
+fn round_to(x: f64, ndigits: i32) -> f64 {
+    let f = 10f64.powi(ndigits);
+    (x * f).round() / f
+}
+
+/// The use-transparency rule shared by solid and textured materials: the
+/// stored transparency applies only when the flag byte is set, else the
+/// material is opaque. The result is the opacity, one minus it. Both call
+/// sites still handle a MISSING f64/flag themselves (solid drops the
+/// material as an invalid record; textured defaults to opaque) — this only holds the rule for when both bytes are present.
+fn use_opacity(v: f64, flag: u8) -> f64 {
+    if flag == 1 {
+        round_to(1.0 - v, 4)
+    } else {
+        1.0
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Strict UTF-16LE decode (skips on invalid, matching Python's try/except).
+fn decode_strict(bytes: &[u8]) -> Option<String> {
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let units: Vec<u16> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
+        .collect();
+    char::decode_utf16(units)
+        .collect::<Result<String, _>>()
+        .ok()
+}
+
+/// Approximates Python's `str.isprintable()` for the (ASCII-dominant) names we
+/// filter: rejects control and separator characters, allows plain space.
+pub(crate) fn is_printable(s: &str) -> bool {
+    s.chars()
+        .all(|c| c == ' ' || (!c.is_control() && !c.is_whitespace()))
+}
+
+/// All `FF FE FF <len:u8>` string-record markers as `(marker_start, len, end)`
+/// where `end = marker_start + 4` (the start of the UTF-16 payload).
+/// Non-overlapping, left-to-right (matches `re.finditer`).
+pub(crate) fn str_markers(d: &[u8]) -> Vec<(usize, usize, usize)> {
+    let mut out = Vec::new();
+    let n = d.len();
+    let mut p = 0;
+    while p + 4 <= n {
+        if d[p] == 0xFF && d[p + 1] == 0xFE && d[p + 2] == 0xFF {
+            out.push((p, d[p + 3] as usize, p + 4));
+            p += 4;
+        } else {
+            p += 1;
+        }
+    }
+    out
+}
+
+/// Decode the UTF-16 name at a marker `(len, end)`, if present and valid.
+pub(crate) fn marker_name(d: &[u8], len: usize, end: usize) -> Option<String> {
+    d.get(end..end + len * 2).and_then(decode_strict)
+}
+
+// ---- materials ----
+
+/// All materials in file order, plus every shared-texture back-reference
+/// as `(material index, referenced CDib global map slot)` — the caller
+/// resolves those slots to owning materials once the §4s anchor is known
+/// (the byte scan alone cannot place slots globally).
+pub fn materials(d: &[u8]) -> (Vec<Material>, Vec<(usize, u16)>) {
+    let n = d.len();
+    let mut out = Vec::new();
+    let mut shared_refs = Vec::new();
+    for (_start, len, end) in str_markers(d) {
+        if len == 0 {
+            continue;
+        }
+        let name = match marker_name(d, len, end) {
+            Some(s) => s,
+            None => continue,
+        };
+        if !is_printable(&name) {
+            continue;
+        }
+        let e = end + len * 2;
+        if d.get(e..e + 2) == Some(b"\x00\x00") && d.get(e + 6..e + 10) == Some(b"\xff\xfe\xff\x00")
+        {
+            // solid: name + 00 00 + RGBA + empty texpath + 8B +
+            // transparency:f64 + USE-TRANSPARENCY flag byte. The stored
+            // f64 applies ONLY when the flag is set — materials routinely
+            // carry stale 0.0/0.5 values with the flag off and render
+            // fully opaque (byte-proven against .dae ground truth across
+            // the corpus and two production models).
+            let opacity = match (f64le(d, e + 18), d.get(e + 26)) {
+                (Some(v), Some(&flag)) => use_opacity(v, flag),
+                _ => continue,
+            };
+            let rgba = match d.get(e + 2..e + 6) {
+                Some(b) => [b[0], b[1], b[2], b[3]],
+                None => continue,
+            };
+            out.push(Material::Solid {
+                name,
+                rgba,
+                opacity,
+                colorize_type: u32le(d, e + 14).unwrap_or(0),
+            });
+        } else if d.get(e..e + 6) == Some(b"\x01\x00\x00\x00\x03\x80") {
+            // textured: name flag + CDib(0x8003) + image + applied size + filename.
+            // The filename sits AFTER the inline image payload, whose length is
+            // declared at e+10 (§4f / §4s CDib = subtype + len + payload) — so
+            // skip it exactly instead of scanning a fixed window (a fixed 40 KB
+            // window lost every texture bigger than it: house.skp's birch.jpg
+            // is 1.7 MB, Wallpaper_Dog_Bone.jpg 56 KB).
+            let mut tex = None;
+            if let Some(ln) = u32le(d, e + 10) {
+                let je = e + 14 + ln as usize;
+                let win_end = (je + 512).min(n);
+                if let Some(win) = d.get(je..win_end) {
+                    for (_ws, wlen, wend) in str_markers(win) {
+                        if let Some(s) = win.get(wend..wend + wlen * 2).and_then(decode_strict) {
+                            let low = s.to_lowercase();
+                            if [".jpg", ".jpeg", ".png", ".tif", ".bmp"]
+                                .iter()
+                                .any(|ext| low.ends_with(ext))
+                            {
+                                tex = Some(s);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            // §4v: a subtype-1 (JPEG) payload is followed by a u32 (70/99
+            // observed, TBD) BEFORE the applied-size f64 pair; a subtype-4
+            // (PNG) payload is followed by w/h directly. The unconditional
+            // +4 here used to report PNG applied sizes as 0×0.
+            let asize = u32le(d, e + 10).and_then(|ln| {
+                let mut je = e + 14 + ln as usize;
+                if u32le(d, e + 6) == Some(1) {
+                    je += 4;
+                }
+                match (f64le(d, je), f64le(d, je + 8)) {
+                    (Some(w), Some(h)) => Some((w, h)),
+                    _ => None,
+                }
+            });
+            // Phase 3.5: the inline CDib payload starts at e+14 with the
+            // declared length at e+10 — the exact bytes the standalone
+            // image carver finds at the same offset.
+            let image_bytes = u32le(d, e + 10).and_then(|ln| {
+                let payload = d.get(e + 14..e + 14 + ln as usize)?;
+                (payload.starts_with(b"\x89PNG") || payload.starts_with(b"\xff\xd8\xff"))
+                    .then(|| payload.to_vec())
+            });
+            // End of the filename record: the rich tail (§8.1) — average
+            // colors and opacity — sits at fixed offsets from here.
+            let ce = u32le(d, e + 10).and_then(|ln| {
+                let mut je = e + 14 + ln as usize;
+                if u32le(d, e + 6) == Some(1) {
+                    je += 4;
+                }
+                let fe = je + 16; // past the applied-size f64 pair
+                mfc_str_end_at(d, fe)
+            });
+            // §4v: the average RGBA sits right after the filename record —
+            // the colour .dae exports use as the material's diffuse.
+            let avg_rgba = ce.and_then(|ce| d.get(ce..ce + 4).map(|b| [b[0], b[1], b[2], b[3]]));
+            // §8.2: the u32 after a JPEG payload is its quality setting.
+            let jpeg_quality = u32le(d, e + 10).and_then(|ln| {
+                (u32le(d, e + 6) == Some(1))
+                    .then(|| u32le(d, e + 14 + ln as usize))
+                    .flatten()
+                    .filter(|q| *q <= 100)
+            });
+            let (colorized, texture_avg_rgba) = ce.map_or((false, None), |ce| textured_kind(d, ce));
+            out.push(Material::Textured {
+                name,
+                texture: tex,
+                applied_size_in: asize,
+                jpeg_quality,
+                image_bytes,
+                avg_rgba,
+                colorized,
+                texture_avg_rgba,
+                colorize_type: ce.and_then(|ce| u32le(d, ce + 17)).unwrap_or(0),
+                opacity: ce.map_or(1.0, |ce| textured_opacity(d, ce)),
+            });
+        } else if d.get(e..e + 4) == Some(b"\x01\x00\x00\x00")
+            && d.get(e + 5).is_some_and(|&b| b & 0x80 == 0)
+        {
+            // textured, SHARED image (§4s addendum): the texture pointer is an
+            // MFC back-ref u16 to an earlier material's CDib object instead of
+            // an inline `03 80` — house.skp's "[Wood Floor Light]1" duplicate
+            // refs slot 23, the original's dib. Layout: flag u32(1) + ref u16 +
+            // f64 width + f64 height + filename + avg RGBA.
+            let asize = match (f64le(d, e + 6), f64le(d, e + 14)) {
+                (Some(w), Some(h)) if w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0 => {
+                    Some((w, h))
+                }
+                _ => continue,
+            };
+            let fe = e + 22;
+            let tex = mfc_str_at(d, fe).filter(|s| {
+                let low = s.to_lowercase();
+                [".jpg", ".jpeg", ".png", ".tif", ".bmp"]
+                    .iter()
+                    .any(|ext| low.ends_with(ext))
+            });
+            if tex.is_none() {
+                continue; // not the back-ref texture shape after all
+            }
+            let ce = mfc_str_end_at(d, fe);
+            let avg_rgba = ce.and_then(|ce| d.get(ce..ce + 4).map(|b| [b[0], b[1], b[2], b[3]]));
+            // The back-ref word is the owning material's CDib global map
+            // slot; the caller copies that material's bytes here.
+            if let Some(r) = u16le(d, e + 4) {
+                shared_refs.push((out.len(), r));
+            }
+            out.push(Material::Textured {
+                name,
+                texture: tex,
+                applied_size_in: asize,
+                jpeg_quality: None,
+                image_bytes: None, // shared: bytes live on the referenced material
+                avg_rgba,
+                colorized: ce.is_some_and(|ce| textured_kind(d, ce).0),
+                texture_avg_rgba: ce.and_then(|ce| textured_kind(d, ce).1),
+                colorize_type: ce.and_then(|ce| u32le(d, ce + 17)).unwrap_or(0),
+                opacity: ce.map_or(1.0, |ce| textured_opacity(d, ce)),
+            });
+        }
+    }
+    (out, shared_refs)
+}
+
+/// Whether a textured record is colourised (type 2) and the average
+/// colour of its image (§8.1), `ce` = the end of the texture-filename
+/// record: the material's colour, a byte, the image's average colour,
+/// the empty string, then the type.
+fn textured_kind(d: &[u8], ce: usize) -> (bool, Option<[u8; 4]>) {
+    if d.get(ce + 9..ce + 13) != Some(b"\xff\xfe\xff\x00") {
+        return (false, None);
+    }
+    let average = d.get(ce + 5..ce + 9).map(|b| [b[0], b[1], b[2], b[3]]);
+    (u32le(d, ce + 13) == Some(2), average)
+}
+
+/// Opacity from a textured record's rich tail (§8.1), `ce` = the end of
+/// the texture-filename record: average RGBA + 1 byte + second average +
+/// empty string + u32 + 4 bytes precede the transparency f64, and the
+/// use-transparency flag byte follows it. Same semantics as solids — the
+/// stored value applies ONLY when the flag is set (house.skp's
+/// "[Translucent Glass Tinted]" stores 0.52 flag-on, the transparency
+/// its .dae export carries as an `RGB_ZERO` transparent colour, so it
+/// shows at 0.48 opacity; every flag-off textured material across the
+/// corpus and the theater benchmark reads opaque).
+fn textured_opacity(d: &[u8], ce: usize) -> f64 {
+    // the empty-string record anchors the fixed offsets; any other tail
+    // shape is undecoded — read opaque rather than misaligned bytes.
+    if d.get(ce + 9..ce + 13) != Some(b"\xff\xfe\xff\x00") {
+        return 1.0;
+    }
+    match (f64le(d, ce + 21), d.get(ce + 29)) {
+        (Some(v), Some(&flag)) => use_opacity(v, flag),
+        _ => 1.0,
+    }
+}
+
+/// Decode the MFC utf16 string record at exactly `off`, if one is there.
+pub(crate) fn mfc_str_at(d: &[u8], off: usize) -> Option<String> {
+    let (len, chars_at) = crate::carchive::mfc_strlen(d, off)?;
+    d.get(chars_at..chars_at + len * 2).and_then(decode_strict)
+}
+
+/// End offset of the MFC utf16 string record at exactly `off` — one past
+/// its last character byte, where the record's tail data starts.
+pub(crate) fn mfc_str_end_at(d: &[u8], off: usize) -> Option<usize> {
+    let (len, chars_at) = crate::carchive::mfc_strlen(d, off)?;
+    Some(chars_at + len * 2)
+}
+
+// ---- scenes ----
+
+/// True when a CCamera object starts at `at` (§10.6): its new-class record
+/// or a class reference, then a body whose up vector (the third f64
+/// triple) is a finite unit vector.
+pub(crate) fn camera_at(d: &[u8], at: usize) -> bool {
+    let Some(tag) = u16le(d, at) else {
+        return false;
+    };
+    let body = if tag == 0xFFFF {
+        // schema u16, name length u16, name
+        if d.get(at + 4..at + 13) != Some(b"\x07\x00CCamera") {
+            return false;
+        }
+        at + 13
+    } else if tag & 0x8000 != 0 {
+        at + 2
+    } else {
+        return false;
+    };
+    let up: Option<Vec<f64>> = (6..9).map(|i| f64le(d, body + i * 8)).collect();
+    match up {
+        Some(v) if v.iter().all(|x| x.is_finite()) => {
+            ((v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt() - 1.0).abs() < 1e-6
+        }
+        _ => false,
+    }
+}
+
+/// True when the object tag in front of the 3-byte preamble at `pre` is
+/// the `CViewPage` new-class record or a class reference (plain or
+/// escalated).
+pub(crate) fn viewpage_tag_before(d: &[u8], pre: usize) -> bool {
+    if pre >= 15 && d.get(pre - 15..pre) == Some(b"\xff\xff\x0c\x00\x09\x00CViewPage") {
+        return true;
+    }
+    // `7F FF` + u32 class reference (§11): the u32's high bit marks a class
+    if pre >= 6 && u16le(d, pre - 6) == Some(0x7FFF) {
+        return u32le(d, pre - 4).is_some_and(|t| t & 0x8000_0000 != 0);
+    }
+    pre >= 2 && u16le(d, pre - 2).is_some_and(|t| t & 0x8000 != 0 && t != 0xFFFF)
+}
+
+// ---- layers ----
+
+pub fn layers(d: &[u8]) -> Vec<Layer> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (start, len, end) in str_markers(d) {
+        if len == 0 {
+            continue;
+        }
+        let s = match marker_name(d, len, end) {
+            Some(s) => s,
+            None => continue,
+        };
+        if let Some(display) = s.strip_prefix("Layer_") {
+            if !seen.contains(display) && start >= 4 {
+                let e = end + len * 2;
+                seen.insert(display.to_string());
+                // the u32 just before 'Layer_<name>' is the hidden flag (1=hidden).
+                let hidden = u32le(d, start - 4).unwrap_or(0);
+                let rgba = match d.get(e + 2..e + 6) {
+                    Some(b) => [b[0], b[1], b[2], b[3]],
+                    None => [0, 0, 0, 0],
+                };
+                out.push(Layer {
+                    name: display.to_string(),
+                    visible: hidden == 0,
+                    rgba,
+                });
+            }
+        }
+    }
+    out
+}
+
+// ---- guides ----
+
+pub fn guides(d: &[u8]) -> Vec<Guide> {
+    let needle = b"CConstructionLine";
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + needle.len() <= d.len() {
+        if &d[i..i + needle.len()] == needle {
+            let p = i + needle.len() + 5 + 10; // skip preamble + drawbase
+            if let (Some(px), Some(py), Some(pz), Some(dx), Some(dy), Some(dz)) = (
+                f64le(d, p),
+                f64le(d, p + 8),
+                f64le(d, p + 16),
+                f64le(d, p + 24),
+                f64le(d, p + 32),
+                f64le(d, p + 40),
+            ) {
+                let pt = [px, py, pz];
+                let dr = [dx, dy, dz];
+                let mag = (dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2]).sqrt();
+                if pt.iter().all(|x| x.abs() < 1e5) && (mag - 1.0).abs() < 1e-6 {
+                    out.push(Guide {
+                        def_index: None,
+                        point_m: [pt[0] / INCH, pt[1] / INCH, pt[2] / INCH],
+                        direction: dr,
+                        pid: 0,
+                        bounds: [
+                            f64le(d, p + 48).unwrap_or(-1e30),
+                            f64le(d, p + 56).unwrap_or(1e30),
+                        ],
+                        // The drawing base before the point.
+                        layer: u16le(d, p - 2).unwrap_or(0),
+                        material: u16le(d, p - 10).filter(|m| *m != 0),
+                        hidden: d.get(p - 8).is_some_and(|b| *b != 0),
+                        casts_shadows: d.get(p - 7).is_none_or(|b| *b != 0),
+                        receives_shadows: d.get(p - 6).is_none_or(|b| *b != 0),
+                        stipple: 0xFFFF,
+                    });
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The solid materials of a stream-container file as `(name, file offset of the RGBA
+/// bytes)`: the transparency f64 follows at +16 and its use flag at +24
+/// (§8.1).
+/// The detection is the one `materials` applies to the solid shape.
+pub(crate) fn solid_material_sites(d: &[u8]) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    for (_start, len, end) in str_markers(d) {
+        if len == 0 {
+            continue;
+        }
+        let Some(name) = marker_name(d, len, end) else {
+            continue;
+        };
+        if !is_printable(&name) {
+            continue;
+        }
+        let e = end + len * 2;
+        if d.get(e..e + 2) == Some(b"\x00\x00") && d.get(e + 6..e + 10) == Some(b"\xff\xfe\xff\x00")
+        {
+            out.push((name, e + 2));
+        }
+    }
+    out
+}
+
+// ---- attributes ----
+
+pub fn attributes(d: &[u8]) -> Vec<Attribute> {
+    let n = d.len();
+    let mut out = Vec::new();
+    for (_start, len, end) in str_markers(d) {
+        if len == 0 {
+            continue;
+        }
+        let key = match marker_name(d, len, end) {
+            Some(s) => s,
+            None => continue,
+        };
+        // skip C[A-Z]... class names (schema byte collides with a type tag)
+        let is_class = {
+            let mut c = key.chars();
+            matches!((c.next(), c.next()), (Some('C'), Some(b)) if b.is_ascii_uppercase())
+        };
+        if !is_printable(&key) || is_class {
+            continue;
+        }
+        let e = end + len * 2;
+        let t = if e < n { d[e] } else { 0 };
+        match t {
+            0x04 => {
+                if let Some(v) = i32le(d, e + 1) {
+                    if v.unsigned_abs() < 1_000_000 {
+                        out.push(Attribute {
+                            key,
+                            value: AttrValue::Int(v),
+                        });
+                    }
+                }
+            }
+            0x06 => {
+                if let Some(v) = f64le(d, e + 1) {
+                    if !v.is_nan() && v.abs() < 1e6 {
+                        out.push(Attribute {
+                            key,
+                            value: AttrValue::F64(v),
+                        });
+                    }
+                }
+            }
+            0x07 => {
+                if let Some(b) = d.get(e + 1).copied() {
+                    if b == 0 || b == 1 {
+                        out.push(Attribute {
+                            key,
+                            value: AttrValue::Bool(b == 1),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+// ---- component definitions / instances / tree ----
+
+struct RawDef {
+    name: String,
+    guid: String,
+    off: usize,
+}
+
+fn component_definitions(d: &[u8]) -> Vec<RawDef> {
+    let mut out = Vec::new();
+    for (start, len, end) in str_markers(d) {
+        if len == 0 {
+            continue;
+        }
+        let name = match marker_name(d, len, end) {
+            Some(s) => s,
+            None => continue,
+        };
+        let after = end + len * 2;
+        if is_printable(&name)
+            && d.get(after..after + 8) == Some(b"\xff\xfe\xff\x00\xff\xfe\xff\x00")
+            && start >= 18
+        {
+            out.push(RawDef {
+                name,
+                guid: hex(&d[start - 18..start - 2]),
+                off: start,
+            });
+        }
+    }
+    out
+}
+
+struct RawInst {
+    defref: u16,
+    off: usize,
+    translation_m: [f64; 3],
+    transform: [f64; 13],
+}
+
+fn component_instances(d: &[u8]) -> Vec<RawInst> {
+    let n = d.len();
+    let mut out = Vec::new();
+    let mut o = 16usize;
+    while o + 104 < n {
+        if o >= 14
+            && d.get(o + 96..o + 104) == Some(b"\x00\x00\x00\x00\x00\x00\xf0\x3f")
+            && d.get(o - 12..o - 2) == Some(b"\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00")
+        {
+            let defref = u16le(d, o - 2).unwrap_or(0);
+            if defref != 0 {
+                let mut v = [0f64; 13];
+                let mut ok = true;
+                for (k, slot) in v.iter_mut().enumerate() {
+                    match f64le(d, o + k * 8) {
+                        Some(x) => *slot = x,
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                let rows_unit = ok
+                    && [0usize, 3, 6].iter().all(|&i| {
+                        let m = (v[i] * v[i] + v[i + 1] * v[i + 1] + v[i + 2] * v[i + 2]).sqrt();
+                        (m - 1.0).abs() < 1e-9
+                    });
+                if rows_unit {
+                    out.push(RawInst {
+                        defref,
+                        off: o,
+                        translation_m: [
+                            round_to(v[9] / INCH, 5),
+                            round_to(v[10] / INCH, 5),
+                            round_to(v[11] / INCH, 5),
+                        ],
+                        transform: v,
+                    });
+                    o += 104;
+                    continue;
+                }
+            }
+        }
+        o += 1;
+    }
+    out
+}
+
+/// Structural instance→definition link (Phase 1.2). The file DECLARES each
+/// definition's archive map index in the pre-list prelude
+/// (`GeometryRun::def_index`), and an instance's def-ref u16 is exactly that
+/// index. What remains is pairing each declared run with its definition
+/// NAME: a definition record serializes as `… <entity list> … <name> …`, so
+/// the name record follows its list — each framed run claims the first
+/// name record after `run.start`, bracketed by the next framed run's start.
+/// Returns `defref → index into defs` only when the pairing is COMPLETE
+/// (every definition claimed by exactly one declared run, every instance
+/// def-ref covered); a partial pairing means some list never surfaced
+/// structurally, and guessing would mislink.
+fn structural_link(
+    defs: &[RawDef],
+    insts: &[RawInst],
+    runs: &[crate::GeometryRun],
+) -> Option<std::collections::HashMap<u16, usize>> {
+    let declared: Vec<(usize, usize)> = runs // (start, def_index), file order
+        .iter()
+        .filter_map(|r| r.def_index.map(|i| (r.start, i)))
+        .collect();
+    if declared.len() < defs.len() {
+        return None;
+    }
+    let mut link = std::collections::HashMap::new();
+    let mut claimed = vec![false; defs.len()];
+    for (k, &(start, idx)) in declared.iter().enumerate() {
+        let upper = declared.get(k + 1).map_or(usize::MAX, |&(s, _)| s);
+        let claim = defs
+            .iter()
+            .enumerate()
+            .find(|(j, x)| !claimed[*j] && x.off > start && x.off < upper)
+            .map(|(j, _)| j);
+        if let Some(j) = claim {
+            claimed[j] = true;
+            if link.insert(idx as u16, j).is_some() {
+                return None; // duplicate declared index — ambiguous
+            }
+        }
+    }
+    if !claimed.iter().all(|&c| c) {
+        return None;
+    }
+    if !insts.iter().all(|i| link.contains_key(&i.defref)) {
+        return None;
+    }
+    Some(link)
+}
+
+/// Component hierarchy: definitions (name+guid) and instances linked to
+/// their definition name. Primary: the structural declared-map-index link
+/// (Phase 1.2). Fallback (RECORDED as `Diagnostic::HeuristicLinkage`): the
+/// previously validated positional zip — instance def-refs sorted ascending
+/// correspond to definitions in serialization (file-offset) order.
+#[allow(clippy::type_complexity)]
+pub fn component_tree(
+    d: &[u8],
+    runs: &[crate::GeometryRun],
+) -> (
+    Vec<Definition>,
+    Vec<Instance>,
+    Vec<(u32, usize)>,
+    Vec<crate::Diagnostic>,
+) {
+    let mut defs = component_definitions(d);
+    defs.sort_by_key(|x| x.off);
+    let insts = component_instances(d);
+    let mut diagnostics = Vec::new();
+
+    let link = match structural_link(&defs, &insts, runs) {
+        Some(link) => link,
+        None => {
+            if !defs.is_empty() && !insts.is_empty() {
+                diagnostics.push(crate::Diagnostic::HeuristicLinkage {
+                    definitions: defs.len(),
+                });
+            }
+            let mut drefs: Vec<u16> = insts.iter().map(|i| i.defref).collect();
+            drefs.sort_unstable();
+            drefs.dedup();
+            if drefs.len() == defs.len() {
+                drefs.iter().enumerate().map(|(k, &dr)| (dr, k)).collect()
+            } else {
+                std::collections::HashMap::new()
+            }
+        }
+    };
+
+    let definitions = defs
+        .iter()
+        .map(|x| Definition {
+            name: x.name.clone(),
+            guid: x.guid.clone(),
+            kind: Default::default(),
+            description: String::new(),
+            source_path: String::new(),
+            behaviour: Default::default(),
+            timestamp: 0,
+            map_index: None, // byte-scan path: the global slot is unknown
+            thumbnail: None,
+            thumbnail_camera: None,
+            flag: true,
+            point_m: [0.0; 3],
+        })
+        .collect();
+    let instances = insts
+        .iter()
+        .map(|i| Instance {
+            pid: 0,
+            slot: None,
+            definition: link.get(&i.defref).map(|&k| defs[k].name.clone()),
+            defref: i.defref as u32,
+            offset: i.off,
+            translation_m: i.translation_m,
+            transform: i.transform,
+            name: None,     // byte-scan path: instance names are unread
+            is_group: None, // byte-scan path: CGroup/CComponentInstance alike
+            material: None, // byte-scan path: the drawbase is unread
+            hidden: None,
+            layer: None,
+            guid: String::new(),
+            casts_shadows: None,
+            receives_shadows: None,
+            locked: None,
+        })
+        .collect();
+    let mut definition_links: Vec<(u32, usize)> =
+        link.into_iter().map(|(dr, k)| (dr as u32, k)).collect();
+    definition_links.sort_unstable();
+    (definitions, instances, definition_links, diagnostics)
+}
+
+// ---- embedded images (CDib carving) ----
+
+const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
+const JPG_MAGIC: &[u8] = b"\xff\xd8\xff";
+
+pub fn images(d: &[u8]) -> Vec<Image> {
+    let n = d.len();
+    let mut out = Vec::new();
+    let mut m = 0usize;
+    while m < n {
+        let (matched, mlen) = if d[m..].starts_with(PNG_MAGIC) {
+            (true, PNG_MAGIC.len())
+        } else if d[m..].starts_with(JPG_MAGIC) {
+            (true, JPG_MAGIC.len())
+        } else {
+            (false, 1)
+        };
+        if matched {
+            if m >= 8 {
+                let fmt = u32le(d, m - 8).unwrap_or(0);
+                let length = u32le(d, m - 4).unwrap_or(0) as usize;
+                if (fmt == 1 || fmt == 4) && (8..=n - m).contains(&length) {
+                    let kind = if d[m..].starts_with(PNG_MAGIC) {
+                        "png"
+                    } else {
+                        "jpg"
+                    };
+                    out.push(Image {
+                        kind: kind.to_string(),
+                        bytes: length,
+                    });
+                }
+            }
+            m += mlen;
+        } else {
+            m += 1;
+        }
+    }
+    out
+}
