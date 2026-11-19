@@ -1,7 +1,7 @@
 name: Build BlackFox SKP converters
 on:
   push:
-    branches: [converter-build-matrix]
+    branches: [main]
     paths:
       - 'converter/**'
       - '.github/workflows/converter-builds.yml'
